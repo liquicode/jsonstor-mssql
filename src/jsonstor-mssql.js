@@ -6,6 +6,15 @@ const jsongin = require( '@liquicode/jsongin' );
 const MSSQL = require( 'mssql' );
 
 
+// ***How long a pooled connection may sit idle before the pool reaps it.***
+//
+// This is the only thing standing between a held pool and a process which will not exit, so it
+// is a correctness value rather than a tuning one. node-mssql's own default is 30 seconds,
+// which leaves a finished test run apparently hung for half a minute. A second is long enough
+// that a conformance row never reconnects, and short enough that nobody waits on it.
+const POOL_IDLE_TIMEOUT_MS = 1000;
+
+
 module.exports = {
 
 	AdapterName: 'jsonstor-mssql',
@@ -237,38 +246,56 @@ module.exports = {
 		//=====================================================================
 		// WithConnection
 		//
-		// ***One pool per statement, which is jsonstor-postgres's pattern rather than
-		// jsonstor-oracle's.*** The Storage interface has no Close, so a held ConnectionPool
-		// would keep sockets in the event loop and the process would not exit - a test run would
-		// hang after its last assertion passed. Oracle can hold a connection because an open
-		// `oracledb` connection lets the process exit; this driver's pool does not.
+		// ***One pool for the life of the storage, drained by its own idle timeout.***
 		//
-		// ***A pool of its own rather than the driver's global one.*** `mssql.connect()` stores
+		// This used to open a pool per statement, on the grounds that the Storage interface has
+		// no Close, so a held pool would keep sockets in the event loop and the process would
+		// not exit. ***That was measured and it is not what happens.*** node-mssql's pool
+		// already defaults to min 0, so it reaps its own idle connections and the process does
+		// exit - it exits idleTimeoutMillis late, and that default is 30 seconds, which is what
+		// read as a hang. Shortening the timeout is the whole fix: 30.4s becomes 1.1s.
+		//
+		// ***The cost of the old pattern was not marginal.*** Against the live server a
+		// statement on a fresh pool is 34ms and a statement on a held pool is 3.8ms, because
+		// every one paid for a TCP connect, a TLS negotiation and a login. One conformance row
+		// of 134 tests went from 75.3s to 11.5s, which took MS Sql Server from the slowest
+		// engine in the family to an ordinary one.
+		//
+		// ***A pool of its own rather than the driver's global one.*** mssql.connect() stores
 		// one pool on the module, so two storages pointed at different servers in the same
 		// process would silently share the first one's connection - which is exactly what a
 		// conformance run does.
+		//
+		// ***Opened through a promise rather than a flag***, so two concurrent first calls
+		// cannot each open a pool and leave the loser's unreachable. This is jsonstor-oracle's
+		// held_connection shape, and like that one it ***forgets a failure***: a server which
+		// did not answer is a transient condition, and remembering it would poison the storage
+		// for its whole life.
+		let connection_pool = null;
 		async function WithConnection( Handler /* ( Pool ) */ )
 		{
-			let pool = new MSSQL.ConnectionPool( {
-				server: Storage.Settings.Server,
-				port: Storage.Settings.Port,
-				database: Storage.Settings.Database,
-				user: Storage.Settings.UserName,
-				password: Storage.Settings.Password,
-				options: {
-					encrypt: Storage.Settings.Encrypt,
-					trustServerCertificate: Storage.Settings.TrustServerCertificate,
-				},
-			} );
-			await pool.connect();
-			try
+			if ( connection_pool === null )
 			{
-				return await Handler( pool );
+				let pool = new MSSQL.ConnectionPool( {
+					server: Storage.Settings.Server,
+					port: Storage.Settings.Port,
+					database: Storage.Settings.Database,
+					user: Storage.Settings.UserName,
+					password: Storage.Settings.Password,
+					options: {
+						encrypt: Storage.Settings.Encrypt,
+						trustServerCertificate: Storage.Settings.TrustServerCertificate,
+					},
+					pool: { min: 0, max: 10, idleTimeoutMillis: POOL_IDLE_TIMEOUT_MS },
+				} );
+				connection_pool = pool.connect().catch(
+					function ( ConnectError )
+					{
+						connection_pool = null;
+						throw ConnectError;
+					} );
 			}
-			finally
-			{
-				await pool.close();
-			}
+			return await Handler( await connection_pool );
 		}
 
 
@@ -370,10 +397,43 @@ module.exports = {
 
 
 		//=====================================================================
+		// ***The catalog is marked known only once it has been read.***
+		//
+		// This used to set `initialized` on the way in, which made a failed read
+		// indistinguishable from an empty database: the flag stayed true, `table_exists` stayed
+		// false, and every later call served that back as a fact. A Count against a server which
+		// was not answering returned ***0*** rather than failing - the first call threw and every
+		// one after it lied, which is the worst shape an error can take here. Setting the flag on
+		// the way out is the whole fix: a read which throws leaves the catalog unknown, and the
+		// next call asks again.
+		//
+		// ***Memoized while it is in flight***, because two concurrent first calls had a quieter
+		// version of the same bug - the second saw the flag the first had just set and carried on
+		// against a catalog which had not been filled in yet.
+		let catalog_read = null;
 		async function update_catalog()
 		{
 			if ( Storage.Catalog.initialized ) { return Storage.Catalog; }
-			Storage.Catalog.initialized = true;
+			if ( catalog_read === null )
+			{
+				catalog_read = read_catalog().then(
+					function ( Catalog )
+					{
+						Storage.Catalog.initialized = true;
+						catalog_read = null;
+						return Catalog;
+					},
+					function ( ReadError )
+					{
+						catalog_read = null;
+						throw ReadError;
+					} );
+			}
+			return await catalog_read;
+		}
+
+		async function read_catalog()
+		{
 			Storage.Catalog.table_exists = false;
 			Storage.Catalog.fields = {};
 			Storage.Catalog.id_field = Storage.Settings.IdField;
