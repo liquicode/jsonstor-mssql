@@ -39,8 +39,10 @@ declare module '@liquicode/jsonstor-mssql'
 		Schema?: string;
 		/** The name of the table to use. */
 		Table: string;
-		/** The column to treat as the document identifier. Empty means none. Defaults to `""`. */
-		IdField?: string;
+		/** The column to treat as the document identifier. Empty discovers it from the table: a column named `_id`, then an auto-increment key. `IdField` is the former spelling and still works. Defaults to `""`. */
+		PrimaryKey?: string;
+		/** Allow an update or a replacement to change the identifier. Off by default, so an operation which would move it is refused by name rather than silently discarded. Defaults to `false`. */
+		PrimaryKeyMutable?: boolean;
 		/** The user to connect as. */
 		UserName: string;
 		/** That user's password. Pass an empty string for none - the setting itself is required. */

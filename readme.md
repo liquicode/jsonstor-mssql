@@ -41,7 +41,8 @@ let storage = jsonstor.GetStorage( 'jsonstor-mssql', {
 	Database: '...',
 	Schema: "dbo",
 	Table: '...',
-	IdField: "",
+	PrimaryKey: "",
+	PrimaryKeyMutable: false,
 	UserName: '...',
 	Password: '...',
 	Encrypt: false,
@@ -86,7 +87,8 @@ Settings
 | `Database` | ***Yes*** | - | The name of the database to use. It must already exist; this adapter never creates a database. |
 | `Schema` | No | `"dbo"` | The schema holding the table. Every statement names it, so the connection's default schema does not decide which table is used. |
 | `Table` | ***Yes*** | - | The name of the table to use. |
-| `IdField` | No | `""` | The column to treat as the document identifier. Empty means none. |
+| `PrimaryKey` | No | `""` | The column to treat as the document identifier. Empty discovers it from the table: a column named `_id`, then an auto-increment key. `IdField` is the former spelling and still works. |
+| `PrimaryKeyMutable` | No | `false` | Allow an update or a replacement to change the identifier. Off by default, so an operation which would move it is refused by name rather than silently discarded. |
 | `UserName` | ***Yes*** | - | The user to connect as. |
 | `Password` | ***Yes*** | - | That user's password. Pass an empty string for none - the setting itself is required. |
 | `Encrypt` | No | `false` | Encrypt the connection. The driver defaults this to `true`, which a server presenting a self-signed certificate refuses; this adapter defaults it to `false` so a local server connects, and a real one should turn it on. |

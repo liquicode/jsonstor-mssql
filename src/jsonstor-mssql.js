@@ -36,7 +36,23 @@ module.exports = {
 		// table.*** Every statement here names the schema, so a catalog read cannot match a
 		// same-named table in another schema and answer with whichever came back first.
 		if ( jsongin.ShortType( Settings.Schema ) !== 's' ) { Settings.Schema = 'dbo'; }
-		if ( jsongin.ShortType( Settings.IdField ) !== 's' ) { Settings.IdField = ''; }
+		// ***The identity settings.*** PrimaryKey is the current spelling and IdField is the
+		// deprecated one; Resolve reads either and prefers the current. jsonstor-mysql and
+		// jsonstor-postgres are published declaring IdField, so unlike the TLS rename this one
+		// reaches released packages and the old spelling goes on working.
+		// See jsonx/.plans/primary-keys-and-indexes.md.
+		let key_declaration = jsonstor.PrimaryKey.Resolve( Settings );
+		if ( key_declaration.Fields.length > 1 )
+		{
+			// ***Declared, not built.*** Every by-key statement here locates a row by a single
+			// value - id_to_key() answers one and select_by_id() takes one - so an adapter which
+			// cannot honor a composite key refuses it by name rather than keying on the first.
+			throw new Error( `This adapter does not support a composite PrimaryKey: [${key_declaration.Fields.join( ', ' )}].` );
+		}
+		// ***Empty still means discover it from the catalog***, which is what a foreign table
+		// needs and is the behavior IdField has always had.
+		Settings.IdField = key_declaration.Fields.length ? key_declaration.Fields[ 0 ] : '';
+		if ( jsongin.ShortType( Settings.PrimaryKeyMutable ) !== 'b' ) { Settings.PrimaryKeyMutable = false; }
 		if ( jsongin.ShortType( Settings.ModifySchema ) !== 'b' ) { Settings.ModifySchema = false; }
 		// ***An unencrypted connection is not the default in this driver.*** node-mssql defaults
 		// `encrypt` to true, which a container with a self-signed certificate refuses. Both are
@@ -903,6 +919,62 @@ module.exports = {
 
 
 		//=====================================================================
+		// Refuses an update or a replace which moved the primary key.
+		//
+		// ***This is the third behavior, and it was the only one which could mislead.*** Measured
+		// across the family on 2026-09-03: MongoDB refuses a $set on the identifier, seven
+		// adapters honor it, and the five SQL adapters did neither - SQL_Update deletes the key
+		// column from the row it writes and then locates the row by the *new* key, so the change
+		// was accepted and went nowhere. Refusing by name is the only answer of the three which
+		// cannot leave a caller believing something happened.
+		//
+		// PrimaryKeyMutable: true restores the old permissiveness for a caller who wants it, and
+		// then the move is a real one because the key column is written.
+		function check_key_move( Before, After )
+		{
+			if ( Storage.Settings.PrimaryKeyMutable ) { return; }
+			let before_key = ( ( Before === null ) || ( typeof Before === 'undefined' ) ) ? null : String( Before );
+			let after_key = ( ( After === null ) || ( typeof After === 'undefined' ) ) ? null : String( After );
+			if ( before_key === after_key ) { return; }
+			throw new Error( `The primary key [${Storage.Catalog.id_field}] is not mutable, and this operation would change it from [${before_key}] to [${after_key}].` );
+		}
+
+
+		//=====================================================================
+		// What the identity settings resolved to, once the catalog has been read.
+		//
+		// ***The key is discovered as often as it is declared***, which is the whole reason this
+		// is reported rather than echoed: a configured IdField wins, then _id by name, and only
+		// then a foreign table's auto-increment column. A caller asking StorageInfo() gets the
+		// one in force rather than the one they passed.
+		function refresh_primary_key_info()
+		{
+			// ***The catalog's answer where there is a table, and the declaration where there is
+			// not.*** A storage whose table has not been created yet still has a primary key - it
+			// is the one the CREATE TABLE is going to use - and answering with an empty list would
+			// report that this storage has no identifier, which is a different fact and a wrong
+			// one. Found by asserting it: D) asks straight after DropStorage.
+			let field = Storage.Catalog.id_field || Storage.Settings.IdField || DEFAULT_ID_FIELD;
+			let column = Storage.Catalog.fields[ field ];
+			Storage.PrimaryKeyInfo = {
+				Fields: field ? [ field ] : [],
+				// ***Read from the catalog and never from a setting.*** The DDL already says what
+				// the column holds, and a setting restating it would be two sources for one fact.
+				// The family default stands in only while the column does not exist yet.
+				Types: field ? [ ( column && column.short_type ) ? column.short_type : jsonstor.PrimaryKey.DEFAULT_TYPE ] : [],
+				Mutable: ( Storage.Settings.PrimaryKeyMutable === true ),
+				// The server fills it in only where the column says so; otherwise this adapter
+				// mints one on insert.
+				Generated: !!( column && column.is_auto_increment ),
+				// ***The database hosts the index***, which is what a PRIMARY KEY is. jsonstor
+				// holds nothing here and RefreshIndex has nothing to rebuild.
+				IndexHostedBy: 'database',
+			};
+			return;
+		}
+
+
+		//=====================================================================
 		// The value which goes in the key column.
 		//
 		// The payload carries the true _id with its true type; this is only what the index
@@ -1106,6 +1178,17 @@ module.exports = {
 				`SELECT CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) AS server_version, @@VERSION AS banner` );
 			let row = answer.results[ 0 ] || {};
 			let banner = ( row.banner || '' ).split( '\n' )[ 0 ].trim();
+			// ***The catalog is read before the answer is assembled***, because the primary key
+			// this reports is the discovered one and not the declared one.
+			//
+			// ***Only when nobody else is already reading it.*** This function is re-entered from
+			// underneath: a statement calls update_catalog(), which reaches ensure_dialect_checked(),
+			// which calls StorageInfo(). Awaiting update_catalog() there awaits the very promise the
+			// outer frame is waiting on, and the storage deadlocks rather than recursing - it hangs
+			// with no stack to read. The guard is the one ensure_dialect_checked() already writes
+			// three lines above its own call, for the same reason.
+			if ( !Storage.Catalog.initialized && ( catalog_read === null ) ) { await update_catalog(); }
+			refresh_primary_key_info();
 			return jsonstor.BuildStorageInfo( Storage, {
 				Product: 'MS Sql Server',
 				Version: row.server_version || '',
@@ -1121,6 +1204,27 @@ module.exports = {
 			Storage.Catalog.initialized = false;
 			await update_catalog();
 			return true;
+		};
+
+
+		//=====================================================================
+		// FlushStorage
+		//=====================================================================
+
+
+		//=====================================================================
+		// RefreshIndex
+		//=====================================================================
+
+
+		// ***A no-op which answers 0, and means it.*** The index is the table's PRIMARY KEY and
+		// the server maintains it; there is nothing here which could go stale and nothing to
+		// rebuild. It is implemented rather than left to the interface stub because the stub
+		// throws, and an adapter which simply has no index to refresh is not an adapter which
+		// forgot to write this. See jsonx/.plans/primary-keys-and-indexes.md.
+		Storage.RefreshIndex = async function ( Options )
+		{
+			return 0;
 		};
 
 
@@ -1269,7 +1373,9 @@ module.exports = {
 			}
 			if ( document )
 			{
+				let previous_key = document[ Storage.Catalog.id_field ];
 				document = jsongin.Update( document, Update );
+				check_key_move( previous_key, document[ Storage.Catalog.id_field ] );
 				document = await SQL_Update( document );
 			}
 			if ( Options.ReturnDocuments )
@@ -1295,7 +1401,9 @@ module.exports = {
 			let documents = await SQL_Query( Criteria, 0, Options );
 			for ( let index = 0; index < documents.length; index++ )
 			{
+				let previous_key = documents[ index ][ Storage.Catalog.id_field ];
 				documents[ index ] = jsongin.Update( documents[ index ], Update );
+				check_key_move( previous_key, documents[ index ][ Storage.Catalog.id_field ] );
 				documents[ index ] = await SQL_Update( documents[ index ] );
 			}
 			if ( Options.ReturnDocuments )
@@ -1325,6 +1433,7 @@ module.exports = {
 			}
 			if ( document )
 			{
+				let previous_key = document[ Storage.Catalog.id_field ];
 				if ( Document )
 				{
 					for ( let key in Document )
@@ -1332,6 +1441,11 @@ module.exports = {
 						document[ key ] = Document[ key ];
 					}
 				}
+				// ***A replacement carrying no primary key keeps the matched document's key***,
+				// which this path has always done because it merges rather than replaces. What is
+				// new is that a replacement carrying a *different* key is refused rather than
+				// written to a row which does not exist.
+				check_key_move( previous_key, document[ Storage.Catalog.id_field ] );
 				document = await SQL_Update( document );
 			}
 			if ( Options.ReturnDocuments )
