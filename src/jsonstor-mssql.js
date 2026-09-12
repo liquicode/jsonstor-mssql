@@ -1341,7 +1341,7 @@ module.exports = {
 		//=====================================================================
 
 
-		Storage.FindMany2 = async function FindMany2( Criteria, Projection, Sort, MaxCount, Options = {} )
+		Storage.FindMany2 = async function FindMany2( Criteria, Projection, Sort, Paging, Options = {} )
 		{
 			// A read returns documents. See the note on FindOne.
 			let documents = await SQL_Query( Criteria, 0, Options );
@@ -1353,7 +1353,7 @@ module.exports = {
 				}
 			}
 			if ( Sort ) { documents = jsongin.Sort( documents, Sort ); }
-			if ( MaxCount && ( MaxCount > 0 ) && ( documents.length > MaxCount ) ) { documents = documents.splice( 0, MaxCount ); }
+			documents = jsonstor.Paging.Apply( documents, Paging );
 			return documents;
 		};
 
