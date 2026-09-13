@@ -88,32 +88,32 @@ Settings
 | `Schema` | No | `"dbo"` | The schema holding the table. Every statement names it, so the connection's default schema does not decide which table is used. |
 | `Table` | ***Yes*** | - | The name of the table to use. |
 | `PrimaryKey` | No | `""` | The column to treat as the document identifier. Empty discovers it from the table: a column named `_id`, then an auto-increment key. `IdField` is the former spelling and still works. |
-| `PrimaryKeyMutable` | No | `false` | Allow an update or a replacement to change the identifier. Off by default, so an operation which would move it is refused by name rather than silently discarded. |
+| `PrimaryKeyMutable` | No | `false` | Allow an update or replacement to change the identifier. When `false`, such an operation is refused. |
 | `UserName` | ***Yes*** | - | The user to connect as. |
 | `Password` | ***Yes*** | - | That user's password. Pass an empty string for none - the setting itself is required. |
 | `Encrypt` | No | `false` | Encrypt the connection. The driver defaults this to `true`, which a server presenting a self-signed certificate refuses; this adapter defaults it to `false` so a local server connects, and a real one should turn it on. |
 | `TrustServerCertificate` | No | `true` | Accept a certificate the machine does not trust. Turn this off wherever `Encrypt` is on and the certificate is a real one. |
 | `ModifySchema` | No | `false` | Allow the adapter to create the schema, the table, and the columns it is told to create. It never adds a column because a document had a field. |
 | `PayloadColumn` | No | `""` | The column which stores the document as JSON text, as an `NVARCHAR(MAX)`. Empty means none, and then every field must already be a column. Created when missing if `ModifySchema` is `true`. |
-| `PayloadSync` | No | `false` | Store the whole document in the payload, making the other columns an index over it. When `false` the payload holds only the fields which have no column. |
+| `PayloadSync` | No | `false` | Store the whole document in the payload, and copy fields into their columns for filtering. When `false`, the payload holds only fields without a column. |
 | `Columns` | No | `[]` | Columns to create, as `{ Name, Type, Key }`. Used only when this adapter creates the table; afterwards the table itself is the authority. |
 
 Peculiarities
 ---------------------------------------------------------------------
 
-- ***A criteria becomes a `WHERE` clause ***and*** is handed to `jsongin`.*** The clause is a pre-filter which decides how many rows leave the server; `jsongin.Query` then decides which of them match. So an operator `SqlExpression` cannot translate is ***left out of the statement rather than refused***, and the result broadens: more rows travel, and the answer is the same one every other adapter gives. What that costs, and which operators it applies to, is described in [Translation Layer](/guides/Translation-Layer.md).
-- ***The table is an index over the document, not the document.*** Real columns are what the `WHERE` clause can filter on; the `PayloadColumn` carries the document itself. ***Which of three configurations you get is decided by two settings:***
-  - ***No `PayloadColumn`.*** The document *is* the columns. A field with no column, or a value SQL has no form for, is ***refused by name*** rather than dropped. Use this to store flat documents in a table you already have.
-  - ***`PayloadColumn` with `PayloadSync: false`.*** The columns hold the fields they have, and the payload holds everything else. Nothing is duplicated, and a column another application writes stays visible to jsonstor.
-  - ***`PayloadColumn` with `PayloadSync: true`.*** The payload holds the whole document and the columns become an index over it. ***This is the only configuration which answers every question the other adapters answer.***
-- ***A column which mirrors the payload is filtered on, then checked again.*** Under `PayloadSync: true` a value which does not fit its column is stored as `NULL` there and kept in the payload, so every condition on such a column is widened to admit `NULL` and `jsongin` decides the row from the payload. The clause narrows the search; it never narrows the answer.
-- ***A boolean is a `BIT` here, and it does pre-filter.*** SQL Server has no `BOOLEAN` type and no `TRUE` literal, so the clause compares a `BIT` against `1` and `0` - but the driver reads one back as a JavaScript boolean, so unlike Oracle this engine stores booleans in columns and filters on them normally.
-- ***`$mod` and the `$bits*` operators are left out of the clause on this engine.*** SQL Server can express both - it spells them `%` and `&` - but the shared translator renders them with `MOD()` and `TRUNCATE()`, which SQL Server does not have. So those conditions are decided by `jsongin` instead, and the only cost is that such a query reads more rows.
-- ***A comparison whose operand is not the column's type is left out of the clause.*** SQL Server answers `Conversion failed when converting the varchar value ... to data type int` rather than coercing, and an aborted statement returns nothing at all - so the condition is dropped and `jsongin` decides it instead.
-- ***The payload column is an `NVARCHAR(MAX)`.*** A parsed form returns its own key order, so a query comparing a whole object would be comparing a document you did not write. `NVARCHAR(MAX)` returns the characters which were stored.
-- ***`ModifySchema: true` lets the adapter alter your database.*** It creates the schema, the table, the columns named in `Columns`, and the `PayloadColumn`. ***It never adds a column because a document had a field***, so your schema is what you declared rather than a record of whatever was inserted first.
-- ***A table this adapter creates has an `NVARCHAR(450)` `_id` and a `_seq` identity column.*** 450 is not arbitrary: an index key is limited to 900 bytes and an `NVARCHAR` character costs two, so it is the longest string which can carry a `PRIMARY KEY`. `_seq` records insertion order, because a `SELECT` with no `ORDER BY` promises none and SQL Server has no row identifier which survives an update; it is never part of a document. A table you bring yourself has no `_seq` and is read in the server's order.
-- ***The connection is unencrypted by default and the driver's is not.*** `Encrypt` defaults to `false` here so that a server presenting a self-signed certificate connects at all. ***Turn it on against anything you care about***, and turn `TrustServerCertificate` off once the certificate is a real one.
+- ***A criteria becomes a `WHERE` clause, and `jsongin` checks every returned row.*** Conditions SQL cannot express are left out of the clause, so more rows are read, but the result is the same as on any other adapter. `$mod` and the `$bits*` operators are always left out. See [Translation Layer](/guides/Translation-Layer.md).
+- ***Two settings choose how a document is stored:***
+  - ***No `PayloadColumn`.*** The document is the columns. A field with no column, or a value its column cannot hold, is refused. Use this for flat documents in an existing table.
+  - ***`PayloadColumn` with `PayloadSync: false`.*** Fields with a column are stored there, and every other field in the payload as JSON. A value which does not fit its column is refused.
+  - ***`PayloadColumn` with `PayloadSync: true`.*** The payload holds the whole document, and the columns are copies used for filtering. ***Only this configuration keeps every document exactly.***
+- ***A value must fit its column exactly.*** A fraction does not fit an `INT`, and a string longer than its `NVARCHAR` does not fit. With `PayloadSync: true` such a value is stored as `NULL` in the column and kept in the payload, so a search still finds it. A condition comparing a column with a value of another type is left out of the clause.
+- ***A boolean is stored in a `BIT` column*** and filtered in the clause.
+- ***Without a payload for a field, an absent field reads back as `null`.*** Use `PayloadSync: true` if that matters.
+- ***`ModifySchema: true` lets the adapter change your database***: it creates the schema, the table, the `Columns` you list, and the `PayloadColumn`. It never adds a column because a document has a new field.
+- ***A table the adapter creates has an `NVARCHAR(450)` `_id` and a `_seq` identity column*** which records insertion order and is never part of a document. The payload column is `NVARCHAR(MAX)`. A table you created has no `_seq` and is read in the server's order.
+- ***The database must already exist.*** A missing database is reported by SQL Server as a failed login for the user.
+- ***`Encrypt` is `false` by default***, unlike the driver's own default, so a server with a self-signed certificate connects. Turn it on for a real server, and turn `TrustServerCertificate` off when its certificate is trusted.
+- `UserName` and `Password` are both required, even when the password is empty.
 
 Storage Interface
 ---------------------------------------------------------------------

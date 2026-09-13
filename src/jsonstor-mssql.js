@@ -782,7 +782,10 @@ module.exports = {
 				{
 					// F2. The column is the only home this field has, so a value it cannot hold
 					// is refused rather than coerced into a lie.
-					throw new Error( `Cannot store the field [${key}], its value does not fit the column's type [${field.type_name}]. Configure a PayloadColumn to store values of any type.` );
+					// The remedy named is the one this configuration lacks: a storage which already has a
+					// payload column refuses here only because PayloadSync is off.
+					let remedy = has_payload ? 'Set PayloadSync to true' : 'Configure a PayloadColumn with PayloadSync true';
+					throw new Error( `Cannot store the field [${key}], its value does not fit the column's type [${field.type_name}]. ${remedy} to store values of any type.` );
 				}
 				row[ key ] = value;
 			}
@@ -897,7 +900,15 @@ module.exports = {
 			for ( let index = 0; index < documents.length; index++ )
 			{
 				let document = row_to_document( documents[ index ] );
-				if ( jsongin.Query( document, translation.Residual ) )
+				// ***A null or undefined residual matches every row.*** It is what a null or
+				// undefined criteria translates to, and both mean every document - but
+				// jsongin.Query refuses either one as a criteria.
+				let matched = true;
+				if ( ( translation.Residual !== null ) && ( typeof translation.Residual !== 'undefined' ) )
+				{
+					matched = jsongin.Query( document, translation.Residual );
+				}
+				if ( matched )
 				{
 					filtered.push( document );
 					if ( MaxDocs && ( filtered.length === MaxDocs ) ) { break; }
@@ -1279,6 +1290,8 @@ module.exports = {
 
 		Storage.InsertMany = async function ( Documents, Options = {} )
 		{
+			// Refused rather than read as an empty list, the way every other adapter refuses it.
+			if ( jsongin.ShortType( Documents ) !== 'a' ) { throw new Error( `Documents must be an array of objects.` ); }
 			let documents = [];
 			for ( let index = 0; index < Documents.length; index++ )
 			{
