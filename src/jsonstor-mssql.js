@@ -1386,10 +1386,22 @@ module.exports = {
 			}
 			if ( document )
 			{
+				// ***An update answers what it changed, not what it matched*** *(user, 2026-09-19)*.
+				// A document which comes back from jsongin.Update equal to the one it was given is
+				// not written, not counted and not returned. The statement below rewrites every
+				// column, so the server's row count could never say this; the comparison is
+				// jsongin.StrictEquals. See jsonx/.plans/update-answers-changed.md.
 				let previous_key = document[ Storage.Catalog.id_field ];
-				document = jsongin.Update( document, Update );
-				check_key_move( previous_key, document[ Storage.Catalog.id_field ] );
-				document = await SQL_Update( document );
+				let updated = jsongin.Update( document, Update );
+				if ( jsongin.StrictEquals( document, updated ) )
+				{
+					document = null;
+				}
+				else
+				{
+					check_key_move( previous_key, updated[ Storage.Catalog.id_field ] );
+					document = await SQL_Update( updated );
+				}
 			}
 			if ( Options.ReturnDocuments )
 			{
@@ -1412,20 +1424,27 @@ module.exports = {
 		Storage.UpdateMany = async function UpdateMany( Criteria, Update, Options = {} )
 		{
 			let documents = await SQL_Query( Criteria, 0, Options );
+			// ***Only the documents which changed are written, counted and returned***, as in
+			// UpdateOne. This answered the length of what the criteria matched, and put
+			// SQL_Update's answer back into that list - a null, when the statement touched no
+			// row - so the list could hold a null and the count still counted it.
+			let changed = [];
 			for ( let index = 0; index < documents.length; index++ )
 			{
 				let previous_key = documents[ index ][ Storage.Catalog.id_field ];
-				documents[ index ] = jsongin.Update( documents[ index ], Update );
-				check_key_move( previous_key, documents[ index ][ Storage.Catalog.id_field ] );
-				documents[ index ] = await SQL_Update( documents[ index ] );
+				let updated = jsongin.Update( documents[ index ], Update );
+				if ( jsongin.StrictEquals( documents[ index ], updated ) ) { continue; }
+				check_key_move( previous_key, updated[ Storage.Catalog.id_field ] );
+				let written = await SQL_Update( updated );
+				if ( written ) { changed.push( written ); }
 			}
 			if ( Options.ReturnDocuments )
 			{
-				return documents;
+				return changed;
 			}
 			else
 			{
-				return documents.length;
+				return changed.length;
 			}
 			return; // Unreachable code.
 		};
@@ -1447,12 +1466,20 @@ module.exports = {
 			if ( document )
 			{
 				let previous_key = document[ Storage.Catalog.id_field ];
+				let found = Object.assign( {}, document );
 				if ( Document )
 				{
 					for ( let key in Document )
 					{
 						document[ key ] = Document[ key ];
 					}
+				}
+				// ***A replacement which puts back what is held changes nothing***, and answers as
+				// an update which changed nothing does: nothing written, 0, and null for the document.
+				if ( jsongin.StrictEquals( found, document ) )
+				{
+					if ( Options.ReturnDocuments ) { return null; }
+					return 0;
 				}
 				// ***A replacement carrying no primary key keeps the matched document's key***,
 				// which this path has always done because it merges rather than replaces. What is
